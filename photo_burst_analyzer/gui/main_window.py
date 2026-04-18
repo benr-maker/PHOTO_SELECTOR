@@ -1,138 +1,409 @@
+"""Photo Burst Analyzer – main application window.
+
+Three-stage triage workflow:
+  Stage 1 (Burst Review)  – one burst at a time, spacebar to accept
+  Stage 3 (Keeper Grid)   – drag/click final curation, then export
+
+Settings accessible at any stage via ⚙ button.
+
+Thread-safety notes
+-------------------
+* Only one analysis can run at a time (_analysis_running guard).
+* The worker thread never writes to Tkinter widgets directly; all GUI
+  mutations go through self.after(0, ...) to run on the main thread.
+* self._bursts is assigned exclusively on the main thread
+  (_on_analysis_complete), so BurstReviewFrame always reads a fully
+  constructed list.
+* BurstReviewFrame installs key bindings on the root window; cleanup()
+  is called before _clear_content() to remove those bindings and prevent
+  stale callbacks from reaching a destroyed frame.
+"""
+
+import threading
+import logging
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-from .preview_grid import PreviewGrid
+
 from ..core.burst_detector import collect_images, detect_candidates
 from ..core.analysis_manager import analyze_photos_and_pairs
 from ..core.exif_sorter import get_exif_timestamp
-import threading, logging, os
-logger = logging.getLogger('pba.gui')
+from ..core.perf_log import PerfStats
+from .burst_review import BurstReviewFrame
+from .keeper_grid import KeeperGridFrame
+from .settings_panel import open_settings, DEFAULT_SETTINGS
+
+logger = logging.getLogger("pba.gui")
+
 
 def main():
-    app = App(); app.mainloop()
+    app = App()
+    app.mainloop()
+
+
+# ── Default session settings ──────────────────────────────────────────────────
+
+def _make_settings():
+    return dict(DEFAULT_SETTINGS)
+
+
+def _settings_to_scoring(s: dict) -> tuple[dict, dict]:
+    """Split app settings into (scoring_settings, scoring_weights) dicts."""
+    scoring_settings = {
+        "use_face_detection": s.get("use_face_detection", True),
+        "top_tile_pct": s.get("top_tile_pct", 20) / 100.0,
+        "tile_count": 8,
+    }
+    scoring_weights = {
+        "sharpness": s.get("sharpness_weight", 50),
+        "exposure": s.get("exposure_weight", 30),
+    }
+    return scoring_settings, scoring_weights
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('Photo Burst Analyzer v6 - Fixed')
-        self.geometry('1200x820')
-        self.create_widgets()
+        self.title("Photo Burst Analyzer")
+        self.geometry("1280x860")
+        self.configure(bg="#1a1a1a")
 
-    def create_widgets(self):
-        top = tk.Frame(self); top.pack(fill='x', padx=8, pady=6)
-        tk.Label(top, text='Burst time threshold (s):').pack(side='left')
-        self.t_var = tk.DoubleVar(value=1.0)
-        tk.Entry(top, textvariable=self.t_var, width=6).pack(side='left', padx=6)
-        # checkboxes
-        self.do_blur = tk.BooleanVar(value=True); self.do_sad = tk.BooleanVar(value=True)
-        tk.Checkbutton(top, text='Blur (Laplacian)', variable=self.do_blur).pack(side='left', padx=6)
-        tk.Checkbutton(top, text='SAD (similarity)', variable=self.do_sad).pack(side='left', padx=6)
-        tk.Button(top, text='Select Directory & Run', command=self.on_run).pack(side='left', padx=6)
-        self.thumb_size = tk.IntVar(value=160)
-        tk.Label(top, text='Thumbnail Size:').pack(side='left', padx=(20,4))
-        s = ttk.Scale(top, from_=120, to=300, orient='horizontal', command=self.on_slider_move); s.set(self.thumb_size.get()); s.pack(side='left')
-        s.bind('<ButtonRelease-1>', self.on_slider_release)
-        # progress and cores info
-        self.progress = ttk.Progressbar(top, orient='horizontal', length=300, mode='determinate')
-        self.progress.pack(side='right', padx=8)
-        self.core_info = tk.Label(top, text='Cores: - | Workers: -', font=('Arial',9)); self.core_info.pack(side='right', padx=8)
-        self.selected_label = tk.Label(top, text='Selected: 0'); self.selected_label.pack(side='right', padx=10)
-        # notebook
-        nb = ttk.Notebook(self); nb.pack(fill='both', expand=True)
-        self.preview_frame = tk.Frame(nb); nb.add(self.preview_frame, text='Previews')
-        self.timeline_frame = tk.Frame(nb); nb.add(self.timeline_frame, text='Timeline')
-        self.grid_widget = PreviewGrid(self.preview_frame, thumb_size=self.thumb_size.get(), selected_callback=self.update_selected_count)
-        self.grid_widget.frame.pack(fill='both', expand=True)
-        self.timeline_canvas = tk.Canvas(self.timeline_frame, bg='#f8f8f8'); self.timeline_canvas.pack(fill='both', expand=True, padx=8, pady=8)
-        bottom = tk.Frame(self); bottom.pack(fill='x', padx=8, pady=6)
-        tk.Button(bottom, text='Save Selected Best Shots', command=self.on_save_selected).pack(side='left')
-        tk.Button(bottom, text='Clear Selection', command=self.on_clear_selection).pack(side='left', padx=6)
-        tk.Button(bottom, text='Quit', command=self.quit).pack(side='right')
+        self._settings = _make_settings()
+        self._bursts: list = []        # multi-photo burst dicts; written on main thread
+        self._single_bursts: list = [] # 1-photo dicts for images not in any burst
+        self._kept_paths: set = set()
+        self._input_dir: str = ""
 
-    def on_run(self):
-        d = filedialog.askdirectory(title='Select photo directory')
-        if not d: return
-        self.input_dir = d; t = self.t_var.get()
-        self.progress['value'] = 0; self.core_info.config(text='Cores: - | Workers: -')
-        threading.Thread(target=self._analyze, args=(d, t, self.do_blur.get(), self.do_sad.get()), daemon=True).start()
+        # Re-entrancy guard: set True while the analysis thread is alive.
+        # Read and written only on the main thread (set before thread starts,
+        # cleared via after() inside the worker's finally block).
+        self._analysis_running: bool = False
 
-    def _analyze(self, d, t, do_blur, do_sad):
+        # Reference to the live BurstReviewFrame so we can call cleanup()
+        # before destroying it (removes root-window key bindings).
+        self._burst_review_frame: BurstReviewFrame | None = None
+
+        self._build_chrome()
+        self._show_welcome()
+
+    # ── Chrome (persistent header) ────────────────────────────────────────────
+
+    def _build_chrome(self):
+        nav = tk.Frame(self, bg="#111", pady=0)
+        nav.pack(fill="x")
+
+        self._app_lbl = tk.Label(nav, text="Photo Burst Analyzer", bg="#111", fg="#eee",
+                                 font=("Arial", 14, "bold"))
+        self._app_lbl.pack(side="left", padx=14, pady=8)
+
+        self._funnel_lbl = tk.Label(nav, text="", bg="#111", fg="#aaa", font=("Arial", 10))
+        self._funnel_lbl.pack(side="left", padx=20)
+
+        self._stage_lbl = tk.Label(nav, text="", bg="#111", fg="#888", font=("Arial", 10))
+        self._stage_lbl.pack(side="left", padx=12)
+
+        # Use tk.Label for nav buttons — tk.Button with custom bg/fg renders
+        # invisible text on macOS until clicked. Labels always paint immediately.
+        tk.Label(nav, text="⚙  Settings", bg="#333", fg="#eee", font=("Arial", 10),
+                 padx=8, pady=4, cursor="hand2").pack(side="right", padx=10, pady=6)
+        nav.winfo_children()[-1].bind("<Button-1>", lambda e: self._open_settings())
+
+        self._new_folder_btn = tk.Label(
+            nav, text="⟳  New Folder", bg="#333", fg="#eee", font=("Arial", 10),
+            padx=8, pady=4, cursor="hand2")
+        self._new_folder_btn.pack(side="right", padx=4, pady=6)
+        self._new_folder_btn.bind("<Button-1>", lambda e: self._new_folder())
+        self._folder_btn_enabled = True
+
+        self._content = tk.Frame(self, bg="#1a1a1a")
+        self._content.pack(fill="both", expand=True)
+
+    def _clear_content(self):
+        """Destroy content children, cleaning up any active stage first."""
+        # Give the active BurstReviewFrame a chance to remove its root bindings
+        # before the frame is destroyed.
+        if self._burst_review_frame is not None:
+            try:
+                self._burst_review_frame.cleanup()
+            except Exception:
+                pass
+            self._burst_review_frame = None
+        for w in self._content.winfo_children():
+            w.destroy()
+
+    # ── Welcome / loading screens ─────────────────────────────────────────────
+
+    def _show_welcome(self):
+        self._stage_lbl.config(text="")
+        self._clear_content()
+        frame = tk.Frame(self._content, bg="#1a1a1a")
+        frame.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(frame, text="📷", font=("Arial", 48), bg="#1a1a1a").pack(pady=8)
+        tk.Label(frame, text="Select a folder of photos to begin",
+                 font=("Arial", 16), fg="#ccc", bg="#1a1a1a").pack()
+        tk.Label(frame, text="Bursts will be detected and ranked automatically",
+                 font=("Arial", 11), fg="#777", bg="#1a1a1a").pack(pady=(4, 20))
+        tk.Button(frame, text="  Select Photo Folder  ", font=("Arial", 13),
+                  bg="#3cb371", fg="white", relief="flat", padx=16, pady=8,
+                  command=self._new_folder).pack()
+
+    def _show_loading(self, total_tasks: int):
+        self._clear_content()
+        frame = tk.Frame(self._content, bg="#1a1a1a")
+        frame.place(relx=0.5, rely=0.5, anchor="center")
+
+        tk.Label(frame, text="Analysing photos…", font=("Arial", 14), fg="#ccc",
+                 bg="#1a1a1a").pack(pady=(0, 16))
+
+        self._progress_bar = ttk.Progressbar(frame, orient="horizontal", length=400,
+                                             mode="determinate", maximum=max(1, total_tasks))
+        self._progress_bar.pack()
+
+        self._progress_lbl = tk.Label(frame, text="", font=("Arial", 10), fg="#888",
+                                      bg="#1a1a1a")
+        self._progress_lbl.pack(pady=6)
+
+        self._worker_lbl = tk.Label(frame, text="", font=("Arial", 9), fg="#666",
+                                    bg="#1a1a1a")
+        self._worker_lbl.pack()
+
+    # ── Stage transitions ─────────────────────────────────────────────────────
+
+    def _show_burst_review(self):
+        self._stage_lbl.config(text="Stage 1 of 2: Burst Review")
+        self._clear_content()
+        frame = BurstReviewFrame(
+            self._content,
+            bursts=self._bursts,
+            on_stage_complete=self._on_burst_review_done,
+            settings=self._settings,
+        )
+        frame.pack(fill="both", expand=True)
+        self._burst_review_frame = frame
+
+    def _on_burst_review_done(self, kept_paths: set):
+        self._burst_review_frame = None  # frame is calling back, it will self-clean
+        # Automatically include all single photos (not part of any burst)
+        for b in self._single_bursts:
+            kept_paths.add(b["burst"][0])
+        self._kept_paths = kept_paths
+        total = sum(len(b["burst"]) for b in self._bursts)
+        self._update_funnel(
+            total=total,
+            after_stage1=len(kept_paths),
+            singles=len(self._single_bursts),
+        )
+        self._show_keeper_grid()
+
+    def _show_keeper_grid(self):
+        self._stage_lbl.config(text="Stage 2 of 2: Final Selection")
+        self._clear_content()
+        # Pass burst photos + single photos together so keeper grid orders them correctly
+        all_bursts = self._bursts + self._single_bursts
+        frame = KeeperGridFrame(
+            self._content,
+            kept_paths=self._kept_paths,
+            all_bursts=all_bursts,
+            on_export_done=self._on_export_done,
+            settings=self._settings,
+        )
+        frame.pack(fill="both", expand=True)
+
+    def _on_export_done(self, count: int, dest: str):
+        self._stage_lbl.config(text=f"Exported {count} photos")
+
+    # ── Funnel counter ────────────────────────────────────────────────────────
+
+    def _update_funnel(self, total: int, after_stage1: int = None, singles: int = 0):
+        parts = [f"Loaded: {total:,}"]
+        if singles:
+            parts.append(f"Singles (auto-kept): {singles:,}")
+        if after_stage1 is not None:
+            parts.append(f"After burst review: {after_stage1:,}")
+        self._funnel_lbl.config(text="   |   ".join(parts))
+
+    # ── Folder selection & analysis ───────────────────────────────────────────
+
+    def _new_folder(self):
+        if self._analysis_running:
+            messagebox.showinfo(
+                "Analysis in progress",
+                "Please wait for the current analysis to finish.")
+            return
+        d = filedialog.askdirectory(title="Select photo folder")
+        if not d:
+            return
+        self._input_dir = d
+        self._start_analysis(d)
+
+    def _start_analysis(self, directory: str):
+        # Guard set on the main thread before the worker thread starts.
+        self._analysis_running = True
+        self._new_folder_btn.config(fg="#666", cursor="arrow")
+        self._new_folder_btn.unbind("<Button-1>")
+        self._folder_btn_enabled = False
+
+        self._show_loading(0)
+        self._stage_lbl.config(text="Analysing…")
+        t = self._settings.get("burst_threshold", 1.0)
+        s_settings, s_weights = _settings_to_scoring(self._settings)
+        max_w = self._settings.get("max_workers", 0) or None
+
+        threading.Thread(
+            target=self._analyze_worker,
+            args=(directory, t, s_settings, s_weights, max_w),
+            daemon=True,
+        ).start()
+
+    def _analyze_worker(self, directory, threshold, s_settings, s_weights, max_workers):
+        """Runs on a background thread. Never touches Tkinter widgets directly."""
+        import os as _os
+        perf = PerfStats("Photo Burst Analyzer")
+        n_workers_used = max(1, min(int(max_workers or (_os.cpu_count() or 4)), 32))
+        augmented = None
+
         try:
-            files = collect_images(d)
+            # ── Phase 1: Image collection ─────────────────────────────────────
+            with perf.phase("Image collection (os.walk)"):
+                files = collect_images(directory)
+
+            if not files:
+                self.after(0, lambda: messagebox.showwarning(
+                    "No images", f"No supported images found in:\n{directory}"))
+                self.after(0, self._show_welcome)
+                return
+
+            # ── Phase 2: EXIF extraction ──────────────────────────────────────
             photos = []
-            for f in files:
-                ts = get_exif_timestamp(f)
-                if ts is not None: photos.append((f, ts))
-            candidates = detect_candidates(photos, t)
-            unique_photos = []
-            pairs = []
-            seen = set()
-            for c in candidates:
-                paths = [p for p,_ in c]
-                for p in paths:
-                    if p not in seen: seen.add(p); unique_photos.append(p)
-                for a,bp in zip(paths, paths[1:]): pairs.append((a,bp))
-            total_tasks = (len(unique_photos) if do_blur else 0) + (len(pairs) if do_sad else 0)
-            self.after(0, lambda: self.progress.config(maximum=total_tasks))
-            def progress_cb(completed, total, pcounts, cores):
-                self.after(0, lambda: self._update_progress_ui(completed, total, pcounts, cores))
-            augmented = analyze_photos_and_pairs(candidates, do_blur=do_blur, do_sad=do_sad, max_workers=None, progress_callback=progress_cb)
-            for a in augmented:
-                a['proc_time'] = a.get('proc_time') or 0.0
-                a['avg_proc_time'] = a.get('avg_proc_time') or 0.0
-            self.after(0, lambda: self.grid_widget.show_bursts(augmented))
-            self.after(0, lambda: self.render_timeline(augmented))
-        except Exception as e:
-            logger.exception('analysis failed'); self.after(0, lambda: messagebox.showerror('Error', str(e)))
-        finally:
-            self.after(0, lambda: self.progress.stop())
+            with perf.phase("EXIF extraction", count=len(files)):
+                for f in files:
+                    ts = get_exif_timestamp(f)
+                    if ts is not None:
+                        photos.append((f, ts))
 
-    def _update_progress_ui(self, completed, total, pcounts, cores):
+            if not photos:
+                self.after(0, lambda: messagebox.showwarning(
+                    "No EXIF timestamps",
+                    "No photos with EXIF timestamps found.\n"
+                    "Burst detection requires DateTimeOriginal in EXIF."))
+                self.after(0, self._show_welcome)
+                return
+
+            # ── Phase 3: Burst detection ──────────────────────────────────────
+            with perf.phase("Burst detection", count=len(photos)):
+                candidates = detect_candidates(photos, threshold)
+
+            # Any image file not in a burst (including files with no EXIF) goes
+            # straight to the keeper grid without needing burst review.
+            burst_paths = {p for c in candidates for p, _ in c}
+            all_file_paths = set(files)
+            # Files with EXIF but outside every burst
+            single_paths = {p for p, _ in photos if p not in burst_paths}
+            # Files without EXIF timestamps at all
+            no_exif_paths = all_file_paths - {p for p, _ in photos}
+            single_paths.update(no_exif_paths)
+
+            if not candidates:
+                # No bursts at all — put everything in keeper grid as singles
+                all_singles = [{"burst": [p], "blur_scores": [None],
+                                "exposures": [None], "composites": [None],
+                                "has_faces": [False], "sads": [None],
+                                "best_idx": 0, "proc_time": 0.0, "avg_proc_time": 0.0}
+                               for p in sorted(single_paths)]
+                self.after(0, lambda s=all_singles: self._on_analysis_complete([], s))
+                return
+
+            total_photos = sum(len(c) for c in candidates)
+            total_pairs = sum(len(c) - 1 for c in candidates)
+            total_tasks = total_photos + total_pairs
+
+            self.after(0, lambda: self._show_loading(total_tasks))
+            self.after(0, lambda: self._update_funnel(total=len(files)))
+
+            def progress_cb(completed, total, pcounts, cores):
+                nonlocal n_workers_used
+                n_workers_used = cores
+                self.after(0, lambda: self._update_loading_progress(completed, total, pcounts, cores))
+
+            # ── Phase 4: Scoring (blur + exposure + SAD) ──────────────────────
+            with perf.phase("Scoring (blur + exposure + SAD)", count=total_photos + total_pairs):
+                augmented = analyze_photos_and_pairs(
+                    candidates,
+                    do_blur=True,
+                    do_sad=True,
+                    max_workers=max_workers,
+                    progress_callback=progress_cb,
+                    settings=s_settings,
+                    weights=s_weights,
+                    perf=perf,
+                )
+
+            # ── Emit full performance report ──────────────────────────────────
+            perf.report(
+                n_photos=total_photos,
+                n_bursts=len(candidates),
+                n_workers=n_workers_used,
+                directory=directory,
+            )
+
+            # Build single-photo burst dicts for images outside any burst.
+            single_burst_dicts = [
+                {"burst": [p], "blur_scores": [None], "exposures": [None],
+                 "composites": [None], "has_faces": [False], "sads": [None],
+                 "best_idx": 0, "proc_time": 0.0, "avg_proc_time": 0.0}
+                for p in sorted(single_paths)
+            ]
+
+            # Hand results to the main thread; self._bursts is assigned there,
+            # so BurstReviewFrame always reads a fully initialised value.
+            self.after(0, lambda a=augmented, s=single_burst_dicts:
+                       self._on_analysis_complete(a, s))
+
+        except Exception as e:
+            logger.exception("Analysis failed")
+            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            self.after(0, self._show_welcome)
+
+        finally:
+            # Always release the guard on the main thread so the button
+            # re-enables regardless of success, early return, or exception.
+            self.after(0, self._release_analysis_guard)
+
+    def _on_analysis_complete(self, augmented: list, single_bursts: list = None):
+        """Runs on the main thread. Safe to assign instance state."""
+        self._bursts = augmented
+        self._single_bursts = single_bursts or []
+        n_singles = len(self._single_bursts)
+        if n_singles:
+            total = sum(len(b["burst"]) for b in self._bursts)
+            self._update_funnel(total=total, singles=n_singles)
+        if self._bursts:
+            self._show_burst_review()
+        else:
+            # Only singles — skip burst review entirely
+            self._kept_paths = {b["burst"][0] for b in self._single_bursts}
+            self._show_keeper_grid()
+
+    def _release_analysis_guard(self):
+        """Runs on the main thread. Resets the re-entrancy guard."""
+        self._analysis_running = False
+        self._new_folder_btn.config(fg="#eee", cursor="hand2")
+        self._new_folder_btn.bind("<Button-1>", lambda e: self._new_folder())
+        self._folder_btn_enabled = True
+
+    def _update_loading_progress(self, completed, total, pcounts, cores):
         try:
-            self.progress['value'] = completed
-            parts = [f'{pid}:{cnt}' for pid,cnt in sorted(pcounts.items())]
-            self.core_info.config(text=f'Cores allocated: {cores} | workers: ' + ','.join(parts))
+            self._progress_bar["maximum"] = max(1, total)
+            self._progress_bar["value"] = completed
+            pct = int(completed / max(1, total) * 100)
+            self._progress_lbl.config(text=f"{completed} / {total} tasks  ({pct}%)")
+            self._worker_lbl.config(text=f"{cores} worker threads")
         except Exception:
             pass
 
-    def render_timeline(self, bursts):
-        c = self.timeline_canvas; c.delete('all')
-        padx=20; pady=20; h=60; y=20
-        for idx,b in enumerate(bursts,1):
-            paths=b.get('burst',[])
-            if not paths: continue
-            x0=padx; x1=padx+min(900,len(paths)*60)
-            c.create_rectangle(x0,y,x1,y+h,fill='#e6f2ff',outline='#5b9bd5')
-            lbl=f'Burst {idx}: {len(paths)} photos, {b.get("proc_time"):.3f}s'
-            c.create_text(x0+6,y+h/2,anchor='w',text=lbl)
-            tx=x0+6; ty=y+6; thumb_h=h-12
-            for p in paths[:12]:
-                try:
-                    from PIL import Image, ImageOps, ImageTk
-                    im=Image.open(p); im=ImageOps.exif_transpose(im); im.thumbnail((thumb_h,thumb_h))
-                    tkimg=ImageTk.PhotoImage(im)
-                    c.image = getattr(c,'image',[]) + [tkimg]
-                    c.create_image(tx,ty,anchor='nw',image=tkimg)
-                    tx+=thumb_h+6
-                except Exception:
-                    pass
-            y+=h+pady
-        c.config(scrollregion=c.bbox('all'))
+    # ── Settings ──────────────────────────────────────────────────────────────
 
-    def on_save_selected(self):
-        dest = filedialog.askdirectory(title='Select destination folder to save selected photos')
-        if not dest: return
-        import shutil; saved=0
-        for p in list(self.grid_widget.selected):
-            try: shutil.copy2(p, os.path.join(dest, os.path.basename(p))); saved+=1
-            except Exception: pass
-        messagebox.showinfo('Saved', f'Saved {saved} files to {dest}')
-
-    def on_clear_selection(self):
-        self.grid_widget.clear_selection(); self.update_selected_count()
-
-    def update_selected_count(self):
-        cnt = len(self.grid_widget.selected); self.selected_label.config(text=f'Selected: {cnt}')
-
-    def on_slider_move(self, val): pass
-    def on_slider_release(self, event):
-        w = event.widget; val = int(float(w.get())); self.thumb_size.set(val); self.grid_widget.set_thumb_size(val); self.grid_widget.show_bursts(self.grid_widget.bursts)
+    def _open_settings(self):
+        self._settings = open_settings(self, self._settings)

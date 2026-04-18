@@ -109,6 +109,10 @@ class App(tk.Tk):
                  padx=8, pady=4, cursor="hand2").pack(side="right", padx=10, pady=6)
         nav.winfo_children()[-1].bind("<Button-1>", lambda e: self._open_settings())
 
+        tk.Label(nav, text="?  Help", bg="#333", fg="#eee", font=("Arial", 10),
+                 padx=8, pady=4, cursor="hand2").pack(side="right", padx=4, pady=6)
+        nav.winfo_children()[-1].bind("<Button-1>", lambda e: self._open_help())
+
         self._new_folder_btn = tk.Label(
             nav, text="⟳  New Folder", bg="#333", fg="#eee", font=("Arial", 10),
             padx=8, pady=4, cursor="hand2")
@@ -407,3 +411,165 @@ class App(tk.Tk):
 
     def _open_settings(self):
         self._settings = open_settings(self, self._settings)
+
+    # ── Help ──────────────────────────────────────────────────────────────────
+
+    def _open_help(self):
+        win = tk.Toplevel(self)
+        win.title("Photo Burst Analyzer — User Manual")
+        win.geometry("780x620")
+        win.resizable(True, True)
+
+        # Toolbar
+        bar = tk.Frame(win, bg="#222", pady=4)
+        bar.pack(fill="x")
+        tk.Label(bar, text="User Manual", bg="#222", fg="#eee",
+                 font=("Arial", 12, "bold"), padx=12).pack(side="left")
+        close = tk.Label(bar, text="Close", bg="#444", fg="#eee",
+                         font=("Arial", 10), padx=10, pady=4, cursor="hand2")
+        close.pack(side="right", padx=8)
+        close.bind("<Button-1>", lambda e: win.destroy())
+
+        # Scrollable text area
+        outer = tk.Frame(win)
+        outer.pack(fill="both", expand=True, padx=8, pady=8)
+        vscroll = ttk.Scrollbar(outer, orient="vertical")
+        vscroll.pack(side="right", fill="y")
+        txt = tk.Text(outer, wrap="word", yscrollcommand=vscroll.set,
+                      font=("Arial", 11), bg="#fafafa", fg="#222",
+                      relief="flat", padx=16, pady=12,
+                      spacing1=2, spacing3=4)
+        txt.pack(fill="both", expand=True)
+        vscroll.config(command=txt.yview)
+
+        # Text styles
+        txt.tag_config("h1", font=("Arial", 16, "bold"), spacing1=14, spacing3=6)
+        txt.tag_config("h2", font=("Arial", 13, "bold"), spacing1=12, spacing3=4)
+        txt.tag_config("h3", font=("Arial", 11, "bold"), spacing1=8, spacing3=2)
+        txt.tag_config("key", font=("Courier", 10, "bold"), background="#e8e8e8")
+        txt.tag_config("tip", foreground="#2a6e3f", font=("Arial", 10, "italic"))
+        txt.tag_config("warn", foreground="#8b0000", font=("Arial", 10, "italic"))
+
+        def h1(t):  txt.insert("end", t + "\n", "h1")
+        def h2(t):  txt.insert("end", t + "\n", "h2")
+        def h3(t):  txt.insert("end", t + "\n", "h3")
+        def p(t):   txt.insert("end", t + "\n\n")
+        def tip(t): txt.insert("end", "Tip:  " + t + "\n\n", "tip")
+        def warn(t):txt.insert("end", "Note:  " + t + "\n\n", "warn")
+        def keys(*ks):
+            # Pad key label to a fixed width so descriptions align in a column.
+            col_w = max(len(k[0]) for k in ks) + 2
+            for k in ks:
+                label = k[0].ljust(col_w)
+                txt.insert("end", f"  {label}", "key")
+                txt.insert("end", f"  —  {k[1]}\n")
+            txt.insert("end", "\n")
+
+        # ── Content ───────────────────────────────────────────────────────────
+        h1("Photo Burst Analyzer")
+        p("When you shoot in burst mode your camera takes 5, 10, or even 20 shots in a "
+          "single second. Most are nearly identical. Picking the sharpest one by eye across "
+          "thousands of photos is tedious and time-consuming.\n\n"
+          "Photo Burst Analyzer does that work for you. It groups shots taken within one second "
+          "of each other into bursts, scores each photo for sharpness and exposure, and presents "
+          "the best candidate already highlighted. You confirm or override, then export only "
+          "the keepers.")
+
+        h2("Getting Started")
+        p("1.  Open the app.\n"
+          "2.  Click  Select Photo Folder  on the welcome screen.\n"
+          "3.  Choose the folder that contains your photos.\n"
+          "4.  Analysis runs automatically. A progress bar shows the status.\n"
+          "5.  When analysis finishes, Stage 1 begins.")
+        tip("Photos without an EXIF timestamp (screenshots, downloaded images) are treated as "
+            "single shots and carried through to the final grid automatically.")
+
+        h2("Stage 1 — Burst Review")
+        h3("What You See")
+        p("A filmstrip of every photo in the current burst runs across the screen. "
+          "The computer's suggested pick has a green border. Below each photo are three "
+          "quality bars:\n\n"
+          "  Sharp  —  how in-focus the photo is\n"
+          "  Expo   —  how well exposed it is\n"
+          "  Score  —  the combined overall rating\n\n"
+          "The status bar shows which burst you are on and how many remain.")
+
+        h3("Making Your Decision")
+        p("Accept the suggestion  —  press Space or click  Accept Best.\n\n"
+          "Pick a different photo  —  click any other photo in the filmstrip to move the "
+          "green border to it, then press Space.\n\n"
+          "Keep more than one photo  —  hold Ctrl and click additional photos. "
+          "Multiple green borders appear. Press Space to keep all of them.\n\n"
+          "Skip the whole burst  —  click  Skip  or press  S.  Nothing is kept.\n\n"
+          "Keep every photo  —  click  Keep All  or press  A.")
+
+        h3("Keyboard Shortcuts — Stage 1")
+        keys(
+            ("Space", "Accept current pick and move to next burst"),
+            ("←  →", "Shift the highlighted pick left or right in the filmstrip"),
+            ("C", "Open the comparison window"),
+            ("A", "Keep all photos in this burst"),
+            ("S", "Skip this burst"),
+            ("Ctrl + click", "Add a photo to the selection"),
+        )
+
+        h3("Comparing Photos Side by Side")
+        p("Click  Compare  (or press C) to open a larger comparison window.\n\n"
+          "  •  All photos in the burst appear in a scrollable row.\n"
+          "  •  Click any photo to select it (green border). Click again to deselect.\n"
+          "  •  Select as many as you like.\n"
+          "  •  Close by clicking  Done, pressing Escape, or clicking the window X.\n"
+          "     Your selections are applied in all cases.\n"
+          "  •  Drag the window corner larger — photos grow with it.\n"
+          "  •  Check  Rule of Thirds  to overlay compositional guide lines.")
+
+        h2("Stage 2 — Final Selection")
+        p("After reviewing all bursts, every accepted photo — plus all single shots — "
+          "appears in a scrollable thumbnail grid.")
+
+        h3("What You Can Do")
+        p("Deselect a photo  —  click it. The green border disappears. Click again to "
+          "re-select it.\n\n"
+          "Reorder photos  —  click and drag a photo to a new position.\n\n"
+          "Adjust thumbnail size  —  drag the  Size  slider in the top-right corner.\n\n"
+          "Select or deselect everything  —  use the  Select All  and  Deselect All  buttons.")
+
+        h3("Exporting")
+        p("1.  Make sure the photos you want have green borders.\n"
+          "2.  Click  Export Selected.\n"
+          "3.  Choose a destination folder.\n"
+          "4.  The app copies your selected photos there.\n"
+          "5.  Exported photos are removed from the grid. Any you did not export remain.")
+        warn("The app never deletes or moves your original photos. Export always copies.")
+
+        h2("Settings  ( ⚙ button, top right )")
+        p("Burst gap (seconds)  —  How close together two shots must be to count as a burst. "
+          "Default is 1 second.\n\n"
+          "Sharpness weight  —  How much focus counts toward the overall score.\n\n"
+          "Exposure weight   —  How much correct exposure counts toward the overall score.\n\n"
+          "Face detection    —  When on, sharpness is measured on detected faces rather than "
+          "the whole image. Best for portraits; slower for landscapes.\n\n"
+          "Thumbnail size    —  Default size of thumbnails in Stage 2.\n\n"
+          "Worker threads    —  How many parallel processes run during analysis. "
+          "0 = automatic (all CPU cores).")
+
+        h2("Understanding the Score Bars")
+        p("Scores run from 0 to 100:\n\n"
+          "  Green   —  65 or above  (good)\n"
+          "  Yellow  —  35 to 64     (acceptable)\n"
+          "  Red     —  below 35     (poor)\n\n"
+          "Sharp is usually the most important bar. A blurry photo is rarely worth keeping "
+          "regardless of exposure.")
+
+        h2("Tips")
+        p("Shooting RAW + JPEG?  Point the app at the JPEG folder for faster analysis, "
+          "then use filenames to locate the matching RAW files for export.\n\n"
+          "Large folders (5,000+ photos) take a few minutes to analyze. The progress bar "
+          "keeps you informed.\n\n"
+          "Turn off Face Detection in Settings for landscapes or wildlife — it is slower "
+          "and not needed when there are no faces to find.\n\n"
+          "Use the comparison window when several photos look nearly identical. Zoom in "
+          "on the key subject and compare the Sharp bar to decide.")
+
+        txt.config(state="disabled")
+        win.bind("<Escape>", lambda e: win.destroy())

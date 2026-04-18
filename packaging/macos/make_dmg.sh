@@ -26,13 +26,11 @@ mkdir -p "$STAGE"
 APP_IN_STAGE="$STAGE/${APP_NAME}.app"
 cp -R "$APP_PATH" "$APP_IN_STAGE"
 
-# Strip quarantine and re-sign ad-hoc. Users may still need right-click
-# → Open on first launch on macOS 13+ without a paid Developer ID cert.
+# Strip quarantine only — do NOT re-codesign. Re-signing overwrites
+# PyInstaller's valid ad-hoc signature and confuses Finder icon display.
+# Users may still need right-click → Open on first launch without a
+# paid Apple Developer ID certificate.
 xattr -cr "$APP_IN_STAGE"
-codesign --force --deep --sign - "$APP_IN_STAGE" 2>/dev/null || true
-
-# Touch the bundle so Finder picks up the icon immediately on mount
-touch "$APP_IN_STAGE"
 
 ln -s /Applications "$STAGE/Applications"
 
